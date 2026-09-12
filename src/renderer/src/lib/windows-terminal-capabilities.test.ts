@@ -3,6 +3,7 @@
 import { act, createElement } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import { resetWindowsTerminalCapabilityReprobeForTests } from './windows-terminal-capability-reprobe'
 import {
   getCachedWindowsTerminalCapabilities,
   getWindowsTerminalCapabilityOwnerKey,
@@ -69,6 +70,7 @@ function stubTerminalCapabilityApi(args: {
   wslDistros?: string[]
   gitBashAvailable?: boolean
   hostPlatform?: NodeJS.Platform | null
+  windowsProcessStartTimeAvailable?: boolean
 }): {
   wslIsAvailable: ReturnType<typeof vi.fn>
   wslListDistros: ReturnType<typeof vi.fn>
@@ -80,9 +82,12 @@ function stubTerminalCapabilityApi(args: {
   const wslListDistros = vi.fn().mockResolvedValue(args.wslDistros ?? [])
   const pwshIsAvailable = vi.fn().mockResolvedValue(args.pwshAvailable)
   const isGitBashAvailable = vi.fn().mockResolvedValue(args.gitBashAvailable ?? false)
-  const runtimeGetStatus = vi
-    .fn()
-    .mockResolvedValue({ hostPlatform: 'hostPlatform' in args ? args.hostPlatform : 'win32' })
+  const runtimeGetStatus = vi.fn().mockResolvedValue({
+    hostPlatform: 'hostPlatform' in args ? args.hostPlatform : 'win32',
+    ...(args.windowsProcessStartTimeAvailable !== undefined
+      ? { windowsProcessStartTimeAvailable: args.windowsProcessStartTimeAvailable }
+      : {})
+  })
 
   vi.stubGlobal('window', {
     api: {
@@ -104,6 +109,7 @@ describe('windows terminal capabilities', () => {
       act(() => root.unmount())
     }
     resetWindowsTerminalCapabilitiesForTests()
+    resetWindowsTerminalCapabilityReprobeForTests()
     vi.unstubAllGlobals()
   })
 
@@ -195,6 +201,24 @@ describe('windows terminal capabilities', () => {
       wslAvailable: true
     })
 
+    expect(wslIsAvailable).toHaveBeenCalledTimes(2)
+  })
+
+  it('rechecks availability when distro discovery invalidates a stale failure', async () => {
+    const wslIsAvailable = vi.fn().mockResolvedValueOnce(false).mockResolvedValueOnce(true)
+    vi.stubGlobal('window', {
+      api: {
+        wsl: { isAvailable: wslIsAvailable, listDistros: vi.fn().mockResolvedValue(['Ubuntu']) },
+        pwsh: { isAvailable: vi.fn().mockResolvedValue(false) },
+        gitBash: { isAvailable: vi.fn().mockResolvedValue(false) },
+        runtime: { getStatus: vi.fn().mockResolvedValue({ hostPlatform: 'win32' }) }
+      }
+    })
+
+    await expect(loadWindowsTerminalCapabilities()).resolves.toMatchObject({
+      wslAvailable: true,
+      wslDistros: ['Ubuntu']
+    })
     expect(wslIsAvailable).toHaveBeenCalledTimes(2)
   })
 
@@ -556,6 +580,87 @@ describe('windows terminal capabilities', () => {
     })
 
     expect(detectRemoteWindowsTerminalCapabilities).toHaveBeenCalledTimes(1)
+  })
+
+  it('refreshes local capabilities while a long-lived consumer remains mounted', async () => {
+    vi.useFakeTimers()
+    const { wslIsAvailable, wslListDistros } = stubTerminalCapabilityApi({
+      wslAvailable: false,
+      pwshAvailable: true,
+      wslDistros: [],
+      windowsProcessStartTimeAvailable: true
+    })
+    wslIsAvailable.mockResolvedValueOnce(false).mockResolvedValue(true)
+    wslListDistros.mockResolvedValueOnce([]).mockResolvedValue(['Ubuntu'])
+    let latest: ReturnType<typeof useWindowsTerminalCapabilities> | null = null
+
+    function HookProbe(): null {
+      latest = useWindowsTerminalCapabilities(true)
+      return null
+    }
+
+    const container = document.createElement('div')
+    document.body.appendChild(container)
+    const root = createRoot(container)
+    hookRoots.push(root)
+
+    try {
+      await act(async () => {
+        root.render(createElement(HookProbe))
+        await Promise.resolve()
+        await Promise.resolve()
+      })
+      expect(latest).toMatchObject({ wslAvailable: false, wslDistros: [] })
+
+      await act(async () => {
+        vi.advanceTimersByTime(30_000)
+        await Promise.resolve()
+        await Promise.resolve()
+      })
+      expect(latest).toMatchObject({ wslAvailable: true, wslDistros: ['Ubuntu'] })
+      expect(wslIsAvailable).toHaveBeenCalledTimes(2)
+      vi.advanceTimersByTime(30_000)
+      expect(wslIsAvailable).toHaveBeenCalledTimes(2)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('bounds re-probes for a Windows host that keeps answering "no WSL"', async () => {
+    vi.useFakeTimers()
+    const { wslIsAvailable, pwshIsAvailable } = stubTerminalCapabilityApi({
+      wslAvailable: false,
+      pwshAvailable: false,
+      wslDistros: []
+    })
+
+    function HookProbe(): null {
+      useWindowsTerminalCapabilities(true)
+      return null
+    }
+
+    const container = document.createElement('div')
+    document.body.appendChild(container)
+    const root = createRoot(container)
+    hookRoots.push(root)
+
+    try {
+      await act(async () => {
+        root.render(createElement(HookProbe))
+        await Promise.resolve()
+        await Promise.resolve()
+      })
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(30 * 60_000)
+      })
+
+      // The ceiling poll preserves install discovery while cutting the old 30s spawn rate.
+      expect(wslIsAvailable.mock.calls.length).toBeLessThanOrEqual(10)
+      expect(pwshIsAvailable.mock.calls.length).toBeLessThanOrEqual(10)
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it.each([

@@ -1,4 +1,5 @@
 import type { RpcClient } from '../transport/rpc-client'
+import { imagePasteWritesFollowedByText } from '../../../src/shared/image-paste-following-text'
 import { buildMobileImagePastePayload } from './mobile-clipboard-image'
 import {
   MOBILE_NATIVE_CHAT_MIN_WRITE_TIMEOUT_MS,
@@ -23,9 +24,14 @@ type PasteImagesArgs = {
   readonly terminal: string
   readonly deviceToken: string | null
   readonly imagePaths: readonly string[]
+  readonly followedByText: boolean
   /** Budget shared with the rest of the user action (the text body that follows, or
    *  the send this is healing for). Omit to open a fresh one for this paste alone. */
   readonly deadline?: number
+  /** Bytes for the leading clear. Defaults to a single Ctrl+U, which clears only
+   *  ONE logical line — callers holding a parked multi-line launch draft must
+   *  pass a burst, or its earlier lines survive and glue onto the message. */
+  readonly clearInput?: string
 }
 
 /** Clears the agent's unsubmitted input line, then pastes each uploaded image
@@ -38,7 +44,9 @@ export async function pasteMobileNativeChatImagePaths({
   terminal,
   deviceToken,
   imagePaths,
-  deadline: sharedDeadline
+  followedByText,
+  deadline: sharedDeadline,
+  clearInput
 }: PasteImagesArgs): Promise<boolean> {
   const mobileClient: MobileTerminalClient | null = deviceToken
     ? { id: deviceToken, type: 'mobile' }
@@ -49,8 +57,8 @@ export async function pasteMobileNativeChatImagePaths({
   // once and let each write draw from what's left.
   const deadline = sharedDeadline ?? openMobileNativeChatSendBudget()
   for (const text of [
-    MOBILE_NATIVE_CHAT_CLEAR_UNSUBMITTED_INPUT,
-    ...imagePaths.map(buildMobileImagePastePayload)
+    clearInput ?? MOBILE_NATIVE_CHAT_CLEAR_UNSUBMITTED_INPUT,
+    ...imagePasteWritesFollowedByText(imagePaths.map(buildMobileImagePastePayload), followedByText)
   ]) {
     const remainingMs = deadline - Date.now()
     // Why: the budget is the whole sequence's — starting a write it can't fund would

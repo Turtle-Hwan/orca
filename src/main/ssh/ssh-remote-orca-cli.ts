@@ -1,10 +1,13 @@
 import type { CliStatusResult, RuntimeStatus } from '../../shared/runtime-types'
+import { runtimeHostConnectionState } from '../../shared/runtime-host-connection-state'
+import { projectRemoteAppStatus } from '../../shared/cli-app-status-projection'
 import { randomUUID } from 'node:crypto'
 import type { RuntimeOrchestrationEnvelope } from '../../shared/runtime-rpc-envelope'
 import { readOrchestrationCompatibilityEvidence } from '../../shared/orchestration-compatibility-evidence'
 import { ORCHESTRATION_CONTRACT_VERSION } from '../../shared/protocol-version'
-import { RpcDispatcher } from '../runtime/rpc/dispatcher'
 import type { RpcResponse } from '../runtime/rpc/core'
+import { RpcDispatcher } from '../runtime/rpc/dispatcher'
+import { ALL_RPC_METHODS } from '../runtime/rpc/methods'
 import type { OrcaRuntimeService } from '../runtime/orca-runtime'
 import {
   HostCliUnavailableError,
@@ -18,6 +21,7 @@ import {
   optionalRemoteCliNumber,
   optionalRemoteCliString,
   parseRemoteCliArgs,
+  readRemoteRetryRequestFlag,
   requiredRemoteCliString,
   resolveRemoteCliHandle
 } from './ssh-remote-cli-args'
@@ -40,7 +44,9 @@ const HOST_INTERACTIVE_COMMANDS: Record<string, string> = {
   'claude-teams':
     'orca claude-teams starts an interactive Claude Code session and cannot run through the SSH relay bridge. Run it in a terminal on the Orca host machine.',
   'agent-teams-tmux':
-    'orca agent-teams-tmux is a tmux pane shim for the Orca host machine and cannot run through the SSH relay bridge.'
+    'orca agent-teams-tmux is a tmux pane shim for the Orca host machine and cannot run through the SSH relay bridge.',
+  'account add':
+    'orca account add runs an interactive agent login and cannot run through the buffered SSH relay bridge. Run it directly in a terminal on the Orca host machine.'
 }
 
 export async function runRemoteOrcaCli(
@@ -52,8 +58,9 @@ export async function runRemoteOrcaCli(
   const json = parsed.flags.has('json')
   const command = parsed.commandPath.join(' ')
 
-  const interactiveMessage = HOST_INTERACTIVE_COMMANDS[parsed.commandPath[0] ?? '']
-  if (interactiveMessage) {
+  const interactiveMessage =
+    HOST_INTERACTIVE_COMMANDS[command] ?? HOST_INTERACTIVE_COMMANDS[parsed.commandPath[0] ?? '']
+  if (interactiveMessage && !parsed.flags.has('help')) {
     if (json) {
       return {
         stdout: `${JSON.stringify(buildRemoteCliError(interactiveMessage, 'unsupported_over_ssh'), null, 2)}\n`,
@@ -97,7 +104,7 @@ async function runLegacyRemoteOrcaCli(
   json: boolean,
   passthroughFailure: HostCliUnavailableError
 ): Promise<RemoteOrcaCliResult> {
-  const dispatcher = new RpcDispatcher({ runtime })
+  const dispatcher = new RpcDispatcher({ runtime, methods: ALL_RPC_METHODS })
   const help = getRemoteLinearHelp(parsed)
   if (help) {
     return { stdout: `${help}\n`, stderr: '', exitCode: 0 }
@@ -150,7 +157,7 @@ async function dispatchRemoteCli(
   const compatibilityEnvelope: RuntimeOrchestrationEnvelope = {
     compatibilityInvocationId: randomUUID(),
     orchestrationRequestId:
-      optionalRemoteCliString(parsed.flags, 'retry-request') ??
+      readRemoteRetryRequestFlag(parsed.flags) ??
       (command === 'orchestration check' || command === 'orchestration ask'
         ? randomUUID()
         : undefined),
@@ -168,14 +175,16 @@ async function dispatchRemoteCli(
       }
       const status = response.result as RuntimeStatus
       const cliStatus: CliStatusResult = {
-        app: {
-          running: true,
-          pid: null,
-          ...(status.desktopWindowStatus ? { desktopWindowStatus: status.desktopWindowStatus } : {})
-        },
+        target: { kind: 'environment', environment: 'ssh' },
+        // Why: this answers for the Orca host the caller reached over SSH, not for the caller's
+        // machine. It used to report running:true unconditionally, which claimed a desktop app
+        // even for a headless `serve`; share the same projection the paired-server path uses so
+        // both transports answer the question the same way (STA-4792 defect 4).
+        app: projectRemoteAppStatus(status),
         runtime: {
           state: status.graphStatus === 'ready' ? 'ready' : 'graph_not_ready',
           reachable: true,
+          connectionState: runtimeHostConnectionState({ hasStatusEntry: true, status }),
           runtimeId: status.runtimeId
         },
         graph: { state: status.graphStatus }
@@ -185,7 +194,10 @@ async function dispatchRemoteCli(
     case 'terminal list':
       return await call(dispatcher, 'terminal.list', {
         worktree: optionalRemoteCliString(parsed.flags, 'worktree'),
-        limit: optionalRemoteCliNumber(parsed.flags, 'limit')
+        limit: optionalRemoteCliNumber(parsed.flags, 'limit'),
+        // Why: agent JSON calls dominate; topology stays available through an explicit opt-in.
+        includeVisualLayouts:
+          !parsed.flags.has('json') || parsed.flags.has('include-visual-layouts')
       })
     case 'orchestration send': {
       const type = optionalRemoteCliString(parsed.flags, 'type')

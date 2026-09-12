@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import type { JiraClientForSite } from './client'
+import type { JiraClientForSite } from './authenticated-request'
 import { credentialDecryptionMessage } from '../../shared/integration-credential-errors'
+import { getJiraSummaryLookupErrorCode } from '../../shared/jira-summary-lookup'
 
 const {
   clearTokenMock,
@@ -20,14 +21,11 @@ const {
   releaseMock: vi.fn()
 }))
 
-vi.mock('./client', () => ({
-  acquire: (...args: unknown[]) => acquireMock(...args),
-  release: (...args: unknown[]) => releaseMock(...args),
+vi.mock('./request-queue', () => ({ acquire: acquireMock, release: releaseMock }))
+
+vi.mock('./authenticated-request', () => ({
   apiBasePath: (site: { authType?: string }) =>
     site.authType === 'server' ? '/rest/api/2' : '/rest/api/3',
-  clearToken: (...args: unknown[]) => clearTokenMock(...args),
-  getClients: (...args: unknown[]) => getClientsMock(...args),
-  isAuthError: (...args: unknown[]) => isAuthErrorMock(...args),
   jiraRequest: (...args: unknown[]) => jiraRequestMock(...args),
   jiraRequestBinary: (...args: unknown[]) => jiraRequestBinaryMock(...args),
   JiraApiError: class JiraApiError extends Error {
@@ -37,6 +35,12 @@ vi.mock('./client', () => ({
       this.status = status
     }
   }
+}))
+
+vi.mock('./client', () => ({
+  clearToken: (...args: unknown[]) => clearTokenMock(...args),
+  getClients: (...args: unknown[]) => getClientsMock(...args),
+  isAuthError: (...args: unknown[]) => isAuthErrorMock(...args)
 }))
 
 function makeEntry(id = 'site-1'): JiraClientForSite {
@@ -115,40 +119,60 @@ describe('Jira issue operations', () => {
     )
   })
 
-  it('sends plain-text bodies and v2 paths for self-hosted issue creation', async () => {
-    getClientsMock.mockReturnValue([makeServerEntry()])
-    jiraRequestMock.mockResolvedValueOnce({ id: '1', key: 'ALP-1', self: '' })
-    const { createIssue } = await import('./issues')
-
-    await createIssue({
-      siteId: 'server-1',
-      projectId: '10000',
-      issueTypeId: '10001',
-      title: 'Fix auth',
-      description: 'Body text'
+  it('loads Jira summaries without descriptions, rendered fields, or attachment media', async () => {
+    jiraRequestMock.mockResolvedValueOnce({
+      id: 'issue-1',
+      key: 'ALP-1',
+      fields: {
+        summary: 'Lightweight lookup',
+        project: { id: '10000', key: 'ALP', name: 'Alpha' },
+        issuetype: { id: '10001', name: 'Bug' },
+        status: { id: '1', name: 'To Do', statusCategory: { key: 'new', name: 'To Do' } },
+        labels: [],
+        created: '2026-07-27T00:00:00.000Z',
+        updated: '2026-07-28T11:22:33.000Z'
+      }
     })
-
-    const [, path, init] = jiraRequestMock.mock.calls[0]
-    expect(path).toBe('/rest/api/2/issue')
-    const body = JSON.parse((init as { body: string }).body) as {
-      fields: { description: unknown }
-    }
-    // REST v2 rejects ADF documents; the description must stay a plain string.
-    expect(body.fields.description).toBe('Body text')
+    const { getIssueSummary } = await import('./issues')
+    await expect(getIssueSummary('ALP-1', 'site-1')).resolves.toMatchObject({
+      key: 'ALP-1',
+      title: 'Lightweight lookup',
+      siteId: 'site-1',
+      createdAt: '2026-07-27T00:00:00.000Z',
+      updatedAt: '2026-07-28T11:22:33.000Z'
+    })
+    const requestPath = String(jiraRequestMock.mock.calls[0]?.[1])
+    const query = new URL(requestPath, 'https://example.atlassian.net').searchParams
+    const fields = query.get('fields')?.split(',') ?? []
+    expect(fields).toEqual(['summary', 'project', 'issuetype', 'status', 'created', 'updated'])
+    expect(query.has('expand')).toBe(false)
+    expect(jiraRequestBinaryMock).not.toHaveBeenCalled()
+    expect(clearTokenMock).not.toHaveBeenCalled()
   })
 
-  it('assigns by username on self-hosted sites', async () => {
-    getClientsMock.mockReturnValue([makeServerEntry()])
-    jiraRequestMock.mockResolvedValue(null)
-    const { updateIssue } = await import('./issues')
-
-    await updateIssue('ALP-1', { assigneeAccountId: 'wquintal' }, 'server-1')
-
-    expect(jiraRequestMock).toHaveBeenCalledWith(
-      expect.anything(),
-      '/rest/api/2/issue/ALP-1/assignee',
-      expect.objectContaining({ body: JSON.stringify({ name: 'wquintal' }) })
+  it('returns typed summary errors without clearing Jira credentials', async () => {
+    const authError = Object.assign(new Error('Unauthorized'), { status: 401 })
+    isAuthErrorMock.mockImplementation((error) => error === authError)
+    jiraRequestMock.mockRejectedValueOnce(authError)
+    const { getIssueSummary } = await import('./issues')
+    const read = getIssueSummary('ALP-1', 'site-1')
+    await expect(read).rejects.toSatisfy(
+      (error: unknown) => getJiraSummaryLookupErrorCode(error) === 'auth'
     )
+    jiraRequestMock.mockRejectedValueOnce(Object.assign(new Error('Missing'), { status: 404 }))
+    await expect(getIssueSummary('ALP-404', 'site-1')).rejects.toSatisfy(
+      (error: unknown) => getJiraSummaryLookupErrorCode(error) === 'not-found'
+    )
+    expect(clearTokenMock).not.toHaveBeenCalled()
+  })
+
+  it('reports an explicit disconnected summary scope before issuing a request', async () => {
+    getClientsMock.mockReturnValueOnce([])
+    const { getIssueSummary } = await import('./issues')
+    await expect(getIssueSummary('ALP-1', 'site-1')).rejects.toSatisfy(
+      (error: unknown) => getJiraSummaryLookupErrorCode(error) === 'disconnected'
+    )
+    expect(jiraRequestMock).not.toHaveBeenCalled()
   })
 
   it('lists self-hosted projects from the unpaged /project resource', async () => {
@@ -327,7 +351,7 @@ describe('Jira issue operations', () => {
     ])
 
     expect(String(jiraRequestMock.mock.calls[0][1])).toContain(
-      '/rest/api/3/issue/createmeta/10000/issuetypes/10001?'
+      '/rest/api/3/issue/createmeta/10000/issuetypes/10001?maxResults=100&startAt=0'
     )
   })
 
