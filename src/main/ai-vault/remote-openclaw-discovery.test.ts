@@ -107,6 +107,40 @@ describe('remote OpenClaw discovery', () => {
     expect(visited).toEqual([root, `${root}/main`, `${root}/main/sessions`])
   })
 
+  it('reports a pruned agent directory that holds transcripts outside sessions/', async () => {
+    const provider = new MemoryRemoteProvider()
+    const root = '/home/ada/.clawdbot/agents'
+    provider.addFile(
+      `${root}/main/sessions/session.jsonl`,
+      messageGraphTranscript('canonical', 'Canonical session'),
+      40
+    )
+    provider.addFile(
+      `${root}/relocated/archive/sessions/old.jsonl`,
+      messageGraphTranscript('old', 'Relocated archive'),
+      41
+    )
+    // A fresh agent carries only its runtime dir; that is not a pruned archive.
+    provider.addFile(`${root}/fresh/agent/models.json`, '{}', 1)
+
+    const result = await scanRemoteAiVaultSessions({
+      provider,
+      executionHostId: 'ssh:dev-box',
+      remoteHome: '/home/ada',
+      hostPlatform: getRemoteHostPlatform('linux-x64')
+    })
+
+    expect(result.sessions.map((session) => session.sessionId)).toEqual(['canonical'])
+    expect(result.issues).toEqual([
+      expect.objectContaining({
+        agent: 'openclaw',
+        executionHostId: 'ssh:dev-box',
+        kind: 'notice',
+        path: `${root}/relocated`
+      })
+    ])
+  })
+
   it('reports an unreadable canonical directory while retaining another agent', async () => {
     const provider = new MemoryRemoteProvider()
     const root = '/home/ada/.openclaw/agents'
